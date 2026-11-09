@@ -39,9 +39,18 @@
     val jmAddress: SigmaProp = PK("`+jm+`")
     val orderAddress: SigmaProp = PK("`+order+`")
 
-    // Determine if distributing tokens or ERG
-    val distributionTokenId: Coll[Byte] = if (SELF.R4[Coll[Byte]].isDefined) SELF.R4[Coll[Byte]].get else Coll[Byte]()
-    val isTokenDistribution: Boolean = distributionTokenId.size > 0
+    // Determine if distributing tokens or ERG from the actual box tokens, and validate R4 consistency
+    val isTokenDistribution: Boolean = SELF.tokens.size > 0
+    val distributionTokenId: Coll[Byte] = if (isTokenDistribution) {
+        SELF.tokens(0)._1
+    } else {
+        Coll[Byte]()
+    }
+    val validR4: Boolean = if (SELF.R4[Coll[Byte]].isDefined && SELF.R4[Coll[Byte]].get.size > 0) {
+        isTokenDistribution && SELF.R4[Coll[Byte]].get == distributionTokenId && SELF.tokens.size == 1
+    } else {
+        SELF.tokens.size <= 1
+    }
 
     // Helper function to get distribution amount from box
     def getDistributionAmount(box: Box): Long = {
@@ -70,18 +79,12 @@
         val jmBoxOUT: Box  = OUTPUTS(2)
         val orderBoxOUT: Box = OUTPUTS(3)
 
-        // Calculate total output amount and dev amount
+        // Prevent spending multiple dev fee boxes in a single transaction (double-satisfaction)
+        val singleFeeInput: Boolean = INPUTS.filter({ (box: Box) => box.propositionBytes == SELF.propositionBytes }).size == 1
+
+        // Calculate total output amount and required distribution amount from SELF
         val outputAmount: Long = OUTPUTS.map({ (output: Box) => output.value }).fold(0L, { (acc: Long, curr: Long) => acc + curr })
-        
-        // For tokens, calculate based on token amounts; for ERG, use ERG values
-        val devAmount: Long = if (isTokenDistribution) {
-            val totalTokenAmount = getDistributionAmount(brunoBoxOUT) + getDistributionAmount(lgdBoxOUT) + 
-                                   getDistributionAmount(jmBoxOUT) + getDistributionAmount(orderBoxOUT)
-            totalTokenAmount
-        } else {
-            // For ERG, the full sum of outputs is the devAmount (miner fee is paid externally)
-            outputAmount
-        }
+        val devAmount: Long = getDistributionAmount(SELF)
 
         val validMinAmount: Boolean = if (isTokenDistribution) {
             // For tokens, only check that we have minimum ERG for boxes
@@ -113,6 +116,8 @@
         }
 
         allOf(Coll(
+            singleFeeInput,
+            validR4,
             validMinAmount,
             validDevBoxes
         ))

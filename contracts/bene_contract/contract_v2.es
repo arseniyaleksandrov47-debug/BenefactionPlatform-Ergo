@@ -129,15 +129,20 @@
       val sameScript = selfScript == OUTPUTS(0).propositionBytes
 
       // Ensures that there are only one or two tokens in the contract (APT and PFT or only APT) for ERG base token
-      // or one, two, or three tokens for non-ERG base token (APT, PFT, and base token)
-      val noAddsOtherTokens = if (isERGBase) {
+      // or one, two, or three tokens for non-ERG base token (APT, PFT, and base token),
+      // and that every token in OUTPUTS(0) belongs to the allowed project token set.
+      val validTokens = OUTPUTS(0).tokens.forall { (token: (Coll[Byte], Long)) =>
+        token._1 == selfId || token._1 == pftTokenId || (!isERGBase && token._1 == baseTokenId)
+      }
+      val noAddsOtherTokens = validTokens && (if (isERGBase) {
         OUTPUTS(0).tokens.size == 1 || OUTPUTS(0).tokens.size == 2
       } else {
         OUTPUTS(0).tokens.size == 1 || OUTPUTS(0).tokens.size == 2 || OUTPUTS(0).tokens.size == 3
-      }
+      })
 
-      // Verify that the output box is a valid copy of the input box
-      sameId && sameBlockLimit && sameMinimumSold && sameExchangeRate && sameConstants && sameProjectContent && sameScript && noAddsOtherTokens
+      // Verify that the output box is a valid copy of the input box and no duplicate contract outputs are created
+      val singleContractOutput = OUTPUTS.filter({(box: Box) => box.propositionBytes == selfScript}).size == 1
+      sameId && sameBlockLimit && sameMinimumSold && sameExchangeRate && sameConstants && sameProjectContent && sameScript && noAddsOtherTokens && singleContractOutput
     }
   }
 
@@ -175,6 +180,12 @@
       }
     }
   })
+
+  // Ensure ERG balance is preserved when replicating in non-ERG token mode
+  val maintainErgValueForTokenMode = isERGBase || !isReplicationBoxPresent || (selfValue == OUTPUTS(0).value)
+
+  // Prevent cross-input double-satisfaction by ensuring only a single contract box is spent per transaction
+  val singleContractInput = INPUTS.filter({(box: Box) => box.propositionBytes == selfScript}).size == 1
 
   // Project owner address as ErgoTree bytes (can be P2PK or P2S)
   val P2PK_ERGOTREE_PREFIX = fromBase16("0008cd")
@@ -275,11 +286,12 @@
 
     val constants = allOf(Coll(
       isSelfReplication,                          // Replicate the contract will be needed always                
+      singleContractInput,                        // Prevent cross-input double-satisfaction across multiple contract boxes
       // endOrReplicate,                          // The contract can't end with this action
       // soldCounterRemainsConstant,              // The sold counter needs to be incremented.
       refundCounterRemainsConstant,               // The refund counter must be constant
       auxiliarExchangeCounterRemainsConstant,     // The auxiliar exchange counter must be constant because there is no exchange between APT -> PFT.
-      // mantainValue,                            // Needs to add value to the contract (for ERG) or maintain value (for tokens)                   
+      maintainErgValueForTokenMode,               // Needs to add value to the contract (for ERG) or maintain ERG value (for tokens)                   
       // APTokenRemainsConstant,                  // APT token is extracted from the contract.
       ProofFundingTokenRemainsConstant           // PFT needs to be constant
     ))
@@ -347,17 +359,19 @@
 
       allOf(Coll(
         deltaTokenAdded == counterIncrement,
-        counterIncrement > 0   // This ensures that the increment is positive, if not, the buy action could be reversed.
+        counterIncrement > 0,  // This ensures that the increment is positive, if not, the buy action could be reversed.
+        selfRefundCounter + counterIncrement + selfAuxiliarExchangeCounter <= selfSoldCounter // Cannot refund more tokens than net sold
       ))
     }
 
     val constants = allOf(Coll(
       isSelfReplication,                          // Replicate the contract will be needed always            
+      singleContractInput,                        // Prevent cross-input double-satisfaction across multiple contract boxes
       // endOrReplicate,                          // The contract can't end with this action
       soldCounterRemainsConstant,                 // The sold counter needs to be constant.
       // refundCounterRemainsConstant,            // Refund counter needs to be incremented.
       auxiliarExchangeCounterRemainsConstant,     // Auxiliar counter needs to be constant.
-      // mantainValue,                            // Needs to extract value (for ERG) or maintain value (for tokens)     
+      maintainErgValueForTokenMode,               // Needs to extract value (for ERG) or maintain ERG value (for tokens)     
       // APTokenRemainsConstant,                  // Needs to add Auxiliar tokens.
       ProofFundingTokenRemainsConstant            // PFT needs to be constant.
     ))
@@ -399,7 +413,7 @@
       val ownerOutput = ownerOutputs(0)
       val devFeeOutput = devFeeOutputs(0)
 
-      // Verify correct project amount
+      // Verify correct project amount (and preserve contract ERG for owner on full token-mode withdrawal)
       val correctProjectAmount = if (isERGBase) {
         ownerOutput.value == projectAmount
       } 
@@ -409,31 +423,36 @@
           token._1 == baseTokenId
         }
         val projectTokenAmount = if (projectTokens.size > 0) projectTokens(0)._2 else 0L
-        projectTokenAmount == projectAmount
+        val preservesErgOnFullWithdraw = isReplicationBoxPresent || (ownerOutput.value >= selfValue)
+        projectTokenAmount == projectAmount && preservesErgOnFullWithdraw
       }
 
-      // Verify correct dev fee
+      // Verify correct dev fee and prevent poisoning devFeeOutput with foreign tokens or mismatched R4
       val correctDevFee = {
+        val devR4Opt = devFeeOutput.R4[Coll[Byte]]
 
         if (isERGBase) {
-          devFeeOutput.value == devFeeAmount
+          val validDevR4 = !devR4Opt.isDefined || devR4Opt.get.size == 0
+          devFeeOutput.value == devFeeAmount && devFeeOutput.tokens.size == 0 && validDevR4
         } 
         
         else {
-          // For non-ERG tokens, verify dev receives correct token amount
+          // For non-ERG tokens, verify dev receives correct token amount as the sole token and valid R4
           val devTokens = devFeeOutput.tokens.filter { (token: (Coll[Byte], Long)) => 
             token._1 == baseTokenId
           }
           val devTokenAmount = if (devTokens.size > 0) devTokens(0)._2 else 0L
-          devTokenAmount == devFeeAmount
+          val validDevR4 = !devR4Opt.isDefined || devR4Opt.get.size == 0 || devR4Opt.get == baseTokenId
+          devTokenAmount == devFeeAmount && devFeeOutput.tokens.size == 1 && validDevR4
         }
       }
 
       val endOrReplicate = {
+        val ended = OUTPUTS.exists({(box: Box) => box.propositionBytes == selfScript}) == false
         val allFundsWithdrawn = if (isERGBase) extractedBaseAmount == selfValue else (extractedBaseAmount == getBaseTokenAmount(SELF))
         val allTokensWithdrawn = SELF.tokens.exists({(pair: (Coll[Byte], Long)) => pair._1 == pftTokenId}) == false
 
-        isSelfReplication || allFundsWithdrawn && allTokensWithdrawn
+        isSelfReplication || (ended && allFundsWithdrawn && allTokensWithdrawn)
       }
 
       val constants = allOf(Coll(
@@ -442,16 +461,19 @@
         soldCounterRemainsConstant,                 // Any of the counter needs to be incremented, so all of them (sold, refund and exchange) need to remain constants.
         refundCounterRemainsConstant,                       
         auxiliarExchangeCounterRemainsConstant,   
-        // mantainValue,                           // Needs to extract value from the contract
+        maintainErgValueForTokenMode,              // Preserve ERG balance when replicating in non-ERG token mode
         APTokenRemainsConstant,                    // There is no need to modify the auxiliar token, so it must be constant
         ProofFundingTokenRemainsConstant           // There is no need to modify the proof of funding token, so it must be constant
       ))
 
       sigmaProp(allOf(Coll(
         constants,
-        minimumReached,           // Project owners are allowed to withdraw base tokens if and only if the minimum number of tokens has been sold.
-        correctDevFee,            // Ensures that the dev fee amount and dev address are correct
-        correctProjectAmount      // Ensures the correct project amount.
+        singleContractInput,                  // Prevent cross-input double-satisfaction across multiple contract boxes
+        extractedBaseAmount > 0L,             // Require strictly positive withdrawal amount
+        devFee <= 0 || devFeeAmount > 0L,     // Prevent 0-fee withdrawal chunking when devFee > 0
+        minimumReached,                       // Project owners are allowed to withdraw base tokens if and only if the minimum number of tokens has been sold.
+        correctDevFee,                        // Ensures that the dev fee amount and dev address are correct
+        correctProjectAmount                  // Ensures the correct project amount.
       )))
     }
     else { sigmaProp(false) }
@@ -478,6 +500,7 @@
     val constants = allOf(Coll(
       // isSelfReplication,                         // FIXED: Changed to endOrReplicate to allow termination
       endOrReplicate,                               // The contract CAN end with this action if all tokens withdrawn
+      singleContractInput,                          // Prevent cross-input double-satisfaction across multiple contract boxes
       soldCounterRemainsConstant,                   // Any of the counter needs to be incremented, so all of them (sold, refund and exchange) need to remain constants.
       refundCounterRemainsConstant,                       
       auxiliarExchangeCounterRemainsConstant,
@@ -498,6 +521,7 @@
 
     val constants = allOf(Coll(
       isSelfReplication,                     // Replicate the contract will be needed always            
+      singleContractInput,                   // Prevent cross-input double-satisfaction across multiple contract boxes
       // endOrReplicate,                     // The contract can't end with this action
       soldCounterRemainsConstant,            // Any of the counter needs to be incremented, so all of them (sold, refund and exchange) need to remain constants.
       refundCounterRemainsConstant,                       
@@ -544,7 +568,10 @@
           outputAlreadyRefundCounter - selfAlreadyCounter
       }
 
-      deltaTemporaryFundingTokenAdded == counterIncrement
+      allOf(Coll(
+        deltaTemporaryFundingTokenAdded == counterIncrement,
+        selfRefundCounter + selfAuxiliarExchangeCounter + counterIncrement <= selfSoldCounter // Cannot exchange more APT than net sold
+      ))
     }
 
     val endOrReplicate = {
@@ -556,6 +583,7 @@
 
     val constants = allOf(Coll(
       isSelfReplication,                        
+      singleContractInput,                                  // Prevent cross-input double-satisfaction across multiple contract boxes
       // endOrReplicate,
       soldCounterRemainsConstant,                           // Sold counter must be constant
       refundCounterRemainsConstant,                         // Refund counter must be constant
